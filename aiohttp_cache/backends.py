@@ -2,7 +2,7 @@ import time
 import pickle
 import asyncio
 import warnings
-
+import base64
 import aiohttp.web
 
 try:
@@ -31,11 +31,11 @@ class BaseCache(object):
     async def set(self, key: str, value: dict, expires: int = 3000):
         raise NotImplementedError()
     
-    def make_key(self, request: aiohttp.web.Request) -> str:
+    async def make_key(self, request: aiohttp.web.Request) -> str:
         key = "{method}#{host}#{path}#{postdata}#{ctype}".format(method=request.method,
                                                                  path=request.rel_url.query_string,
                                                                  host=request.url.host,
-                                                                 postdata="".join(request.post()),
+                                                                 postdata=base64.b64encode( await request.read()).decode('utf-8'),
                                                                  ctype=request.content_type)
         
         return key
@@ -84,9 +84,10 @@ class RedisCache(BaseCache):
         BaseCache.__init__(self, config.expiration)
         _loop = loop or asyncio.get_event_loop()
         
-        self._redis_pool = _loop.run_until_complete(aioredis.create_pool((config.host, config.port),
+        self._redis_pool = _loop.run_until_complete(aioredis.create_redis_pool((config.host, config.port),
                                                                          db=config.db,
-                                                                         password=config.password))
+                                                                 password=config.password))
+        self.redis = self._redis_pool
         self.key_prefix = config.key_prefix
     
     def dump_object(self, value: dict) -> bytes:
@@ -113,10 +114,9 @@ class RedisCache(BaseCache):
             return value
     
     async def get(self, key: str):
-        async with self._redis_pool.get() as redis:
-            redis_value = await redis.get(self.key_prefix + key)
+        redis_value = await self.redis.get(self.key_prefix + key)
             
-            return self.load_object(redis_value)
+        return self.load_object(redis_value)
     
     async def set(self, key: str, value: dict, expires: int = 3000):
         dump = self.dump_object(value)
@@ -124,31 +124,26 @@ class RedisCache(BaseCache):
         _expires = self._calculate_expires(expires)
         
         if _expires == 0:
-            async with self._redis_pool.get() as redis:
-                await redis.set(name=self.key_prefix + key,
+             await self.redis.set(name=self.key_prefix + key,
                                 value=dump)
         else:
-            async with self._redis_pool.get() as redis:
-                await redis.setex(key=self.key_prefix + key,
+            await self.redis.setex(key=self.key_prefix + key,
                                   seconds=_expires,
                                   value=dump)
     
     async def delete(self, key: str):
-        async with self._redis_pool.get() as redis:
-            await redis.delete(self.key_prefix + key)
+        await self.redis.delete(self.key_prefix + key)
     
     async def has(self, key: str) -> bool:
-        async with self._redis_pool.get() as redis:
-            return await redis.exists(self.key_prefix + key)
+        return await self.redis.exists(self.key_prefix + key)
     
     async def clear(self):
-        async with self._redis_pool.get() as redis:
-            if self.key_prefix:
-                keys = await redis.keys(self.key_prefix + '*')
-                if keys:
-                    await redis.delete(*keys)
-            else:
-                await redis.flushdb()
+        if self.key_prefix:
+            keys = await self.redis.keys(self.key_prefix + '*')
+            if keys:
+                    await self.redis.delete(*keys)
+        else:
+            await self.redis.flushdb()
 
 
 # --------------------------------------------------------------------------
